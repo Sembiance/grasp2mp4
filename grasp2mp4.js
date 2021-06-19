@@ -4,8 +4,10 @@ const XU = require("@sembiance/xu"),
 	fileUtil = require("@sembiance/xutil").file,
 	runUtil = require("@sembiance/xutil").run,
 	cmdUtil = require("@sembiance/xutil").cmd,
+	gd = require("node-gd"),
 	fs = require("fs"),
 	path = require("path"),
+	util = require("util"),
 	tiptoe = require("tiptoe");
 
 const argv = cmdUtil.cmdInit({
@@ -14,9 +16,9 @@ const argv = cmdUtil.cmdInit({
 	opts        :
 	{
 		force       : {desc : "Overwrite any existing MP4 files in outDirPath"},
-		rate        : {desc : "Frame rate to use for output video", defaultValue : 60},
 		keep        : {desc : "Keep temporary working files around"},
 		quiet       : {desc : "Don't output any progress messages"},
+		verbose     : {desc : "Be extra chatty"},
 		speed       : {desc : "How fast to render the video", defaultValue : 150},
 		maxDuration : {desc : "Maximum duration of video, in seconds", noShort : true, defaultValue : 300}
 	},
@@ -26,10 +28,11 @@ const argv = cmdUtil.cmdInit({
 		{argid : "outDirPath", desc : "Output directory", required : true}
 	]});
 
+const MAX_SPEED = 10000;	// max speed allowed in GRASP spec
+const SLOWEST_FADE = XU.SECOND*3;
+
 if(!fileUtil.existsSync(argv.graspFilePath))
 	process.exit(XU.log`graspFilePath file path ${argv.graspFilePath} does not exist`);
-
-argv.maxFrames = argv.rate*argv.maxDuration;
 
 function grasp2mp4(cb)
 {
@@ -54,7 +57,15 @@ function grasp2mp4(cb)
 		function processScriptFile(glFilePaths)
 		{
 			const scripts = {};
-			const baseState = {glFilesDirPath, outDirPath : argv.outDirPath, pics : {}, clips : {}, wipDirPath};
+			const baseState =
+			{
+				glFilesDirPath,
+				outDirPath : argv.outDirPath,
+				picPaths   : {},
+				clipPaths  : {},
+				wipDirPath
+			};
+
 			glFilePaths.forEach(glFilePath =>
 			{
 				// Rename files so they don't have the dexvert prefix. We assume all filenames will be unique
@@ -74,13 +85,13 @@ function grasp2mp4(cb)
 				}
 				else if(glFileExt===".pic")
 				{
-					baseState.pics[fileNameNoExt] = newFilePath;
-					baseState.pics[path.basename(newFilePath)] = newFilePath;
+					baseState.picPaths[fileNameNoExt] = newFilePath;
+					baseState.picPaths[path.basename(newFilePath)] = newFilePath;
 				}
 				else if(glFileExt===".clp")
 				{
-					baseState.clips[fileNameNoExt] = newFilePath;
-					baseState.clips[path.basename(newFilePath)] = newFilePath;
+					baseState.clipPaths[fileNameNoExt] = newFilePath;
+					baseState.clipPaths[path.basename(newFilePath)] = newFilePath;
 				}
 			});
 	
@@ -126,23 +137,32 @@ function processScript(state, cb)
 		fileUtil.unlinkSync(outMP4FilePath);
 	}
 
-	state.l = 0;	// Current line being executed
-	state.f = 0;	// Frame counter
+	state.l = 0;		// Current line being executed
+	state.frames = [];	// An array of GD image frames to use for the video
+	state.duration = 0;	// Current duration of video
 	state.labels = {};	// label : lineNum
 	state.marks = {};	// lineNum : count
-	state.picBuf = {};
-	state.clipBuf = {};
-	state.backgroundColor = "black";
-	state.prepared = {clips : {}, pics : {}};
+	state.picBuf = {};	// Loaded GD images from PLOAD
+	state.clipBuf = {};	// Loaded GD images from CLOAD
 
 	tiptoe(
 		function processLines()
 		{
 			processLine(state, this);
 		},
+		function writeFramesToDisk()
+		{
+			if(!argv.quiet)
+				XU.log`Writing frames to disk...`;
+			
+			state.frames.parallelForEach((frame, subcb, i) => fs.writeFile(path.join(state.framesDirPath, `${i.toString().padStart(9, "0")}.png`), frame.pngPtr(), {encoding : null}, subcb), this);
+		},
 		function makeMovie()
 		{
-			const ffmpegArgs = ["-r", argv.rate, "-f", "image2", "-s", state.video.resolution.join("x"), "-i", `%0${argv.maxFrames.toString().length}d.png`];
+			if(!argv.quiet)
+				XU.log`Making movie from frames...`;
+
+			const ffmpegArgs = ["-r", argv.rate, "-f", "image2", "-s", state.video.resolution.join("x"), "-i", `%09d.png`];
 			ffmpegArgs.push("-c:v", "libx264", "-crf", "15", "-preset", "slow", "-pix_fmt", "yuv420p", "-movflags", "faststart", path.resolve(outMP4FilePath));
 			runUtil.run("ffmpeg", ffmpegArgs, {cwd : state.framesDirPath, silent : true}, this);
 		},
@@ -153,7 +173,6 @@ function processScript(state, cb)
 const msg = (state, msgData, cb) =>
 {
 	XU.log`${state.scriptName}@${state.l.toLocaleString().padStart(state.scriptLines.length.toLocaleString().length, " ")}: ${XU.cf.fg.white(msgData)}`;
-	//XU.log`state: ${state}`;
 	if(cb)
 		setImmediate(cb);
 };
@@ -163,6 +182,9 @@ const cmds = {};
 // VIDEO mode - Switches screen video mode
 cmds.VIDEO = (argRaw, state, cb) =>
 {
+	if(state.video)
+		return msg(state, `VIDEO Changing video mode more than once is not currently supported`, cb);
+
 	const MODES =
 	{
 		/* eslint-disable array-bracket-spacing, no-multi-spaces */
@@ -189,15 +211,16 @@ cmds.VIDEO = (argRaw, state, cb) =>
 		return msg(state, `VIDEO Unsupported mode ${mode} (${argRaw})`, cb);
 	
 	state.video = MODES[mode];
+	state.screen = gd.createTrueColorSync(...state.video.resolution);
+
 	cb();
 };
 
 // PLOAD picName,bufNum - Load a picture into a picBuf
 cmds.PLOAD = (argRaw, state, cb) =>
 {
-	const [picName, bufNum] = argRaw.split(",").map(v => v.trim());
-	state.picBuf[bufNum] = picName;
-	cb();
+	const [imageName, bufNum] = argRaw.split(",").map(v => v.trim());
+	loadImage(state, {imageName, bufNum}, "pic", cb);
 };
 
 // PALETTE bufNum - Set the current working pallete from a pic in picBuf
@@ -208,8 +231,7 @@ cmds.PALETTE = (argRaw, state, cb) =>
 		return msg(state, `PALETTE No pic buf loaded in ${bufNum} (${argRaw})`, cb);
 
 	// Changing palettes, let's ditch any prepared clips/cips
-	state.prepared = {clips : {}, pics : {}};
-	state.palette = state.picBuf[bufNum];
+	state.palette = state.picBuf[bufNum].originalPath;
 	cb();
 };
 
@@ -219,9 +241,14 @@ cmds.PFREE = (argRaw, state, cb) =>
 	argRaw.split(",").map(v => v.trim()).forEach(bufNum =>
 	{
 		if(!state.picBuf[bufNum])
+		{
 			msg(state, `PFREE No pic buf loaded in ${bufNum} (${argRaw})`);
+		}
 		else
+		{
+			// TODO: state.picBuf[bufNum].image.destroy()
 			delete state.picBuf[bufNum];
+		}
 	});
 
 	cb();
@@ -230,65 +257,58 @@ cmds.PFREE = (argRaw, state, cb) =>
 // CLOAD clipName, bufNum, shiftParm - Loads a clip into a clipBuf
 cmds.CLOAD = (argRaw, state, cb) =>
 {
-	const [clipName, bufNum] = argRaw.split(",").map(v => v.trim());
-	state.clipBuf[bufNum] = clipName;
-	cb();
+	const [imageName, bufNum] = argRaw.split(",").map(v => v.trim());
+	loadImage(state, {imageName, bufNum}, "clip", cb);
 };
 
-// FLY startX, startY, endX, endY, flyInc, flyDelay, clip1, clip2, ...clipn - Animate 1 or more clippings between two points on the screen
+// FLY startX, startY, endX, endY, increment, delay, clip1, clip2, ...clipn - Animate 1 or more clippings between two points on the screen
 cmds.FLY = (argRaw, state, cb) =>
 {
-	const [startX, startY, endX, endY, flyInc, delay, ...clipNums] = argRaw.split(",").map(v => v.trim());
+	const [startX, startY, endXRaw, endYRaw, increment, delay, ...clipNums] = argRaw.split(",").map(v => v.trim());
 
-	tiptoe(
-		function prepareClips()
+	const endX = +endXRaw;
+	const endY = +endYRaw;
+	let x = +startX;
+	let y = +startY;
+	let seenAllClips = false;
+	const clipsLeft = Array.from(clipNums);
+	for(;x!==endX || y!==endY || (!seenAllClips && clipsLeft.length>0);)
+	{
+		if(clipsLeft.length===0)
 		{
-			prepareImages(state, clipNums.unique().map(clipNum => state.clipBuf[clipNum]), "clips", this);
-		},
-		function generateFrames()
+			seenAllClips = true;
+			clipsLeft.push(...clipNums);
+		}
+
+		if(startX<endX)
 		{
-			const frames = [];
-			let x = startX;
-			let y = startY;
-			let seenAllClips = false;
-			const clipsLeft = Array.from(clipNums);
-			for(;x!==endX || y!==endY || (!seenAllClips && clipsLeft.length>0);)
-			{
-				frames.push({x, y, imageFilePath : state.prepared.clips[state.clipBuf[clipsLeft.shift()]], delay});
+			x += increment;
+			x = Math.min(x, endX);
+		}
+		else if(startX>endX)
+		{
+			x -= Math.abs(increment);
+			x = Math.max(x, endX);
+		}
 
-				if(clipsLeft.length===0)
-				{
-					seenAllClips = true;
-					clipsLeft.push(...clipNums);
-				}
+		if(startY<endY)
+		{
+			y += increment;
+			y = Math.min(y, endY);
+		}
+		else if(startY>endY)
+		{
+			y -= Math.abs(increment);
+			y = Math.max(y, endY);
+		}
 
-				if(startX<endX)
-				{
-					x += flyInc;
-					x = Math.min(x, endX);
-				}
-				else if(startX>endX)
-				{
-					x -= Math.abs(flyInc);
-					x = Math.max(x, endX);
-				}
-
-				if(startY<endY)
-				{
-					y += flyInc;
-					y = Math.min(y, endY);
-				}
-				else if(startY>endY)
-				{
-					y -= Math.abs(flyInc);
-					y = Math.max(y, endY);
-				}
-			}
-
-			frames.serialForEach((frame, subcb) => writeFrame(state, frame, subcb), this);
-		},
-		function returnResult(err) { cb(err); }
-	);
+		const frame = gd.createFromPngPtr(state.screen.pngPtr());
+		const clipImage = state.clipBuf[clipsLeft.shift()].image;
+		clipImage.copy(frame, +x, +y, 0, 0, clipImage.width, clipImage.height);
+		state.frames.push(frame);
+	}
+	
+	cb();
 };
 
 // GOTO labelName - Jump to the given label in the program
@@ -297,8 +317,11 @@ cmds.GOTO = (argRaw, state, cb) =>
 	const labelName = argRaw.trim();
 	if(!state.labels.hasOwnProperty(labelName))
 		return msg(state, `GOTO Label not found yet ${labelName}`, cb);
-		
-	cb(undefined, state.labels[labelName]);
+	
+	if(argv.verbose)
+		msg(state, `GOTO Jumping to label ${labelName} at line ${state.labels[labelName]}`);
+	cb();	// TODO TEMPORARY
+	//cb(undefined, state.labels[labelName]);
 };
 
 // MARK markCount - Marks the place that LOOP will return to
@@ -320,84 +343,97 @@ cmds.LOOP = (argRaw, state, cb) =>
 	if(typeof targetMarkLine==="undefined")
 		return cb();
 
-	XU.log`Looping back to ${targetMarkLine} with ${state.marks[targetMarkLine]} loops remaining...`;
+	if(argv.verbose)
+		msg(state, `LOOP Looping back to ${targetMarkLine} with ${state.marks[targetMarkLine]} loops remaining...`);
 	state.marks[targetMarkLine]--;
 	cb(undefined, targetMarkLine);
 };
 
-function getFrameFilePath(state)
+// PFADE fadeNum, bufNum, speed, delay - Fades a picture to the screen
+/*cmds.PFADE = (argRaw, state, cb) =>
 {
-	return path.join(state.framesDirPath, `${state.f.toString().padStart(argv.maxFrames.toString().length, "0")}.png`);
-}
+	const [fadeNum, bufNum, speed=3000, delay=0] = argRaw.split(",").map(v => v.trim());	// eslint-disable-line no-unused-vars
+	if(bufNum==="0")
+	{
+		if(!argv.quiet)
+			msg(state, `PFADE Unsupported bufNum of 0`);
+		
+		return cb();
+	}
+	//#FFF7D7
+	const fadeFrameCount = getFrameCountFromDuration(SLOWEST_FADE-speed.scale(0, MAX_SPEED, 0, SLOWEST_FADE));
+	const frames = [].pushSequence(1, fadeFrameCount).map(i => ({x : 0, y : 0, imageFilePath : state.prepared.pics[state.picBuf[bufNum]].filePath, dissolve : i.scale(1, fadeFrameCount, 0, 1).ease("easeInSide").scale(0, 1, 0, 100)}));
+	frames.serialForEach((frame, subcb) => writeFrame(state, frame, subcb), err => cb(err));
+};*/
 
-function writeFrame(state, frame, cb)
+/*function writeFrame(state, frame, cb)
 {
 	const frameFilePath = getFrameFilePath(state);
 	state.f++;
 
-	tiptoe(
-		function writeFrameFile()
-		{
-			runUtil.run("convert", ["-size", state.video.resolution.join("x"), `xc:${state.backgroundColor}`, frame.imageFilePath, "-geometry", `+${frame.x}+${frame.y}`, "-composite", frameFilePath], runUtil.SILENT, this);
-		},
-		function createDelaySymlinks()
-		{
-			if(!frame.delay)
-				return this();
+	const convertArgs = ["-size", state.video.resolution.join("x"), `xc:${state.backgroundColor}`, frame.imageFilePath, "-geometry", `+${frame.x}+${frame.y}`];
+	if(frame.hasOwnProperty("dissolve"))
+		convertArgs.push("-compose", "dissolve", "-define", `compose:args=${frame.dissolve.toString()}`);
+	convertArgs.push("-composite", frameFilePath);
+	state.cps.push(runUtil.run("convert", convertArgs, {silent : true, detached : true}));
 
-			const msPerFrame = (XU.SECOND/argv.rate);
-			const delayFrameCount = Math.floor((frame.delay*(XU.SECOND/argv.speed))/msPerFrame);
-			[].pushSequence(0, delayFrameCount-1).serialForEach((i, subcb) =>
-			{
-				const symlinkFramePath = getFrameFilePath(state);
-				state.f++;
-				fs.symlink(path.basename(frameFilePath), symlinkFramePath, subcb);
-			}, this);
-		},
-		cb
-	);
-}
+	if(!frame.delay)
+		return setImmediate(cb);
+
+	const msPerFrame = (XU.SECOND/argv.rate);
+	const delayFrameCount = Math.floor(((frame.delay || 0)*(XU.SECOND/argv.speed))/msPerFrame);
+	if(delayFrameCount===0)
+		return setImmediate(cb);
+
+	[].pushSequence(0, delayFrameCount-1).serialForEach((i, subcb) =>
+	{
+		const symlinkFramePath = getFrameFilePath(state);
+		state.f++;
+		fs.symlink(path.basename(frameFilePath), symlinkFramePath, subcb);
+	}, cb);
+}*/
 
 // Will pre-convert the given images into PNG, using state.palette if set
-function prepareImages(state, imageNames, imageType, cb)
+function loadImage(state, images, imageType, cb)
 {
-	const prepDirPath = fileUtil.generateTempFilePath(state.wipDirPath, "-prepareImages");
+	const prepDirPath = fileUtil.generateTempFilePath(state.wipDirPath, "-loadImages");
 	fs.mkdirSync(prepDirPath);
 
-	imageNames.parallelForEach((imageName, subcb) =>
+	Array.force(images).parallelForEach(({imageName, bufNum}, subcb) =>
 	{
-		if(state.prepared[imageType][imageName])
-			return setImmediate(subcb);
-
 		tiptoe(
 			function convertImage()
 			{
 				const dearkArgs = ["-od", prepDirPath, "-o", `${imageType}-${imageName}`, "-m", "pcpaint"];
 				if(state.palette)
-					dearkArgs.push("-file2", state.pics[state.palette]);
-				dearkArgs.push(state[imageType][imageName]);
+					dearkArgs.push("-file2", state.palette);
+				dearkArgs.push(state[`${imageType}Paths`][imageName]);
 
 				runUtil.run("deark", dearkArgs, runUtil.SILENT, this);
 			},
-			function addPreparedReference()
+			function loadIntoBuf()
 			{
-				state.prepared[imageType][imageName] = path.join(prepDirPath, `${imageType}-${imageName}.000.png`);
+				const imageFilePath = path.join(prepDirPath, `${imageType}-${imageName}.000.png`);
+				state[`${imageType}Buf`][bufNum] = {originalPath : state[`${imageType}Paths`][imageName], filePath : imageFilePath, image : gd.createFromPngPtr(fs.readFileSync(imageFilePath))};
+				
 				this();
 			},
 			subcb
 		);
-	}, cb);
+	}, err => cb(err), {atOnce : 20});
 }
 
 function processLine(state, cb)
 {
-	if(state.f>=argv.maxFrames)
-		return setImmediate(cb);
+	// TODO convert to duration
+	//if(state.f>=argv.maxFrames)
+	//	return setImmediate(cb);
 
 	const scriptLine = state.scriptLines[state.l];
 	tiptoe(
 		function parseLine()
 		{
+			// First check to see if we are defining a label
 			const {labelName} = (scriptLine.match(/^(?<labelName>\S+):/) || {groups : {}}).groups;
 			if(labelName)
 			{
@@ -431,6 +467,12 @@ function processLine(state, cb)
 			if(err)
 				process.exit(XU.log`${XU.cf.fg.red("ERROR")} ${state.scriptName}@${state.l}: ${err}`);
 			
+			if(!["undefined", "number"].includes(typeof nextLine))
+			{
+				console.trace();
+				process.exit(XU.log`${XU.cf.fg.red("ERROR")} ${state.scriptName}@${state.l}: Invalid nextLine returned`);
+			}
+
 			if(typeof nextLine!=="undefined")
 				state.l = nextLine;
 			else if(state.l+1===state.scriptLines.length)

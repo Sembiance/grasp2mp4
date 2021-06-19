@@ -9,6 +9,7 @@
 	"dependencies" : {
 		"@sembiance/xu"    : "file:/mnt/compendium/DevLab/node-modules/xu",
 		"@sembiance/xutil" : "file:/mnt/compendium/DevLab/node-modules/xutil",
+		"node-gd"          : "~2.1.1",
 		"tiptoe"           : "file:/mnt/compendium/DevLab/node-modules/tiptoe"
 	}
 }
