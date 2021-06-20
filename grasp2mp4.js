@@ -7,7 +7,6 @@ const XU = require("@sembiance/xu"),
 	gd = require("node-gd"),
 	fs = require("fs"),
 	path = require("path"),
-	util = require("util"),
 	tiptoe = require("tiptoe");
 
 const argv = cmdUtil.cmdInit({
@@ -16,10 +15,11 @@ const argv = cmdUtil.cmdInit({
 	opts        :
 	{
 		force       : {desc : "Overwrite any existing MP4 files in outDirPath"},
+		rate        : {desc : "Frame rate to use for output video", defaultValue : 30},
 		keep        : {desc : "Keep temporary working files around"},
 		quiet       : {desc : "Don't output any progress messages"},
 		verbose     : {desc : "Be extra chatty"},
-		speed       : {desc : "How fast to render the video", defaultValue : 150},
+		speed       : {desc : "How fast to render the video", defaultValue : 5000},
 		maxDuration : {desc : "Maximum duration of video, in seconds", noShort : true, defaultValue : 300}
 	},
 	args :
@@ -30,6 +30,7 @@ const argv = cmdUtil.cmdInit({
 
 const MAX_SPEED = 10000;	// max speed allowed in GRASP spec
 const SLOWEST_FADE = XU.SECOND*3;
+const MAX_FRAMES = argv.rate*argv.maxDuration;
 
 if(!fileUtil.existsSync(argv.graspFilePath))
 	process.exit(XU.log`graspFilePath file path ${argv.graspFilePath} does not exist`);
@@ -155,7 +156,26 @@ function processScript(state, cb)
 			if(!argv.quiet)
 				XU.log`Writing frames to disk...`;
 			
-			state.frames.parallelForEach((frame, subcb, i) => fs.writeFile(path.join(state.framesDirPath, `${i.toString().padStart(9, "0")}.png`), frame.pngPtr(), {encoding : null}, subcb), this);
+			const frameFilename = function frameFilename(frameNum)
+			{
+				return `${frameNum.toString().padStart(9, "0")}.png`;
+			};
+
+			state.frames.parallelForEach((frame, subcb, i) =>
+			{
+				if(frame===".")
+				{
+					let prevRealFrame=i-1;
+					for(;state.frames[prevRealFrame]===".";prevRealFrame--)
+						;
+
+					fs.symlink(frameFilename(prevRealFrame), path.join(state.framesDirPath, frameFilename(i)), subcb);
+				}
+				else
+				{
+					fs.writeFile(path.join(state.framesDirPath, frameFilename(i)), frame.pngPtr(), {encoding : null}, subcb);
+				}
+			}, this, {atOnce : 20});
 		},
 		function makeMovie()
 		{
@@ -220,7 +240,8 @@ cmds.VIDEO = (argRaw, state, cb) =>
 cmds.PLOAD = (argRaw, state, cb) =>
 {
 	const [imageName, bufNum] = argRaw.split(",").map(v => v.trim());
-	loadImage(state, {imageName, bufNum}, "pic", cb);
+	state.picBuf[bufNum] = imageName;
+	cb();
 };
 
 // PALETTE bufNum - Set the current working pallete from a pic in picBuf
@@ -231,7 +252,7 @@ cmds.PALETTE = (argRaw, state, cb) =>
 		return msg(state, `PALETTE No pic buf loaded in ${bufNum} (${argRaw})`, cb);
 
 	// Changing palettes, let's ditch any prepared clips/cips
-	state.palette = state.picBuf[bufNum].originalPath;
+	state.palette = state.picPaths[state.picBuf[bufNum]];
 	cb();
 };
 
@@ -241,14 +262,9 @@ cmds.PFREE = (argRaw, state, cb) =>
 	argRaw.split(",").map(v => v.trim()).forEach(bufNum =>
 	{
 		if(!state.picBuf[bufNum])
-		{
 			msg(state, `PFREE No pic buf loaded in ${bufNum} (${argRaw})`);
-		}
 		else
-		{
-			// TODO: state.picBuf[bufNum].image.destroy()
 			delete state.picBuf[bufNum];
-		}
 	});
 
 	cb();
@@ -258,58 +274,94 @@ cmds.PFREE = (argRaw, state, cb) =>
 cmds.CLOAD = (argRaw, state, cb) =>
 {
 	const [imageName, bufNum] = argRaw.split(",").map(v => v.trim());
-	loadImage(state, {imageName, bufNum}, "clip", cb);
-};
-
-// FLY startX, startY, endX, endY, increment, delay, clip1, clip2, ...clipn - Animate 1 or more clippings between two points on the screen
-cmds.FLY = (argRaw, state, cb) =>
-{
-	const [startX, startY, endXRaw, endYRaw, increment, delay, ...clipNums] = argRaw.split(",").map(v => v.trim());
-
-	const endX = +endXRaw;
-	const endY = +endYRaw;
-	let x = +startX;
-	let y = +startY;
-	let seenAllClips = false;
-	const clipsLeft = Array.from(clipNums);
-	for(;x!==endX || y!==endY || (!seenAllClips && clipsLeft.length>0);)
-	{
-		if(clipsLeft.length===0)
-		{
-			seenAllClips = true;
-			clipsLeft.push(...clipNums);
-		}
-
-		if(startX<endX)
-		{
-			x += increment;
-			x = Math.min(x, endX);
-		}
-		else if(startX>endX)
-		{
-			x -= Math.abs(increment);
-			x = Math.max(x, endX);
-		}
-
-		if(startY<endY)
-		{
-			y += increment;
-			y = Math.min(y, endY);
-		}
-		else if(startY>endY)
-		{
-			y -= Math.abs(increment);
-			y = Math.max(y, endY);
-		}
-
-		const frame = gd.createFromPngPtr(state.screen.pngPtr());
-		const clipImage = state.clipBuf[clipsLeft.shift()].image;
-		clipImage.copy(frame, +x, +y, 0, 0, clipImage.width, clipImage.height);
-		state.frames.push(frame);
-	}
-	
+	state.clipBuf[bufNum] = imageName;
 	cb();
 };
+
+// FLY/FLOAT startX, startY, endX, endY, increment, delay, clip1, clip2, ...clipn - Animate 1 or more clippings between two points on the screen
+cmds.FLY = (...args) => flyFloat("fly", ...args);
+cmds.FLOAT = (...args) => flyFloat("float", ...args);
+function flyFloat(type, argRaw, state, cb)
+{
+	const [startX, startY, endXRaw, endYRaw, increment, delay, ...clipNums] = argRaw.split(",").map(v => v.trim());
+	const clipNumsUnique = clipNums.unique();
+
+	tiptoe(
+		function loadImages()
+		{
+			loadImage(state, clipNumsUnique, "clip", this);
+		},
+		function createFrames(images)
+		{
+			const endX = +endXRaw;
+			const endY = +endYRaw;
+			let x = +startX;
+			let y = +startY;
+			let seenAllClips = false;
+			const clipsLeft = Array.from(clipNums);
+			let lastFrame = null;
+			for(;x!==endX || y!==endY || (!seenAllClips && clipsLeft.length>0);)
+			{
+				if(clipsLeft.length===0)
+				{
+					seenAllClips = true;
+					clipsLeft.push(...clipNums);
+				}
+
+				if(startX<endX)
+				{
+					x += increment;
+					x = Math.min(x, endX);
+				}
+				else if(startX>endX)
+				{
+					x -= Math.abs(increment);
+					x = Math.max(x, endX);
+				}
+
+				if(startY<endY)
+				{
+					y += increment;
+					y = Math.min(y, endY);
+				}
+				else if(startY>endY)
+				{
+					y -= Math.abs(increment);
+					y = Math.max(y, endY);
+				}
+
+				const frame = gd.createFromPngPtr(state.screen.pngPtr());
+				const clipImage = images[clipNumsUnique.indexOf(clipsLeft.shift())];
+				clipImage.copy(frame, +x, +y, 0, 0, clipImage.width, clipImage.height);
+				state.frames.push(frame);
+
+				// FLY will actually copy to the screen and leave remnants behind, FLOAT will only leave the last frame
+				lastFrame = frame;
+				if(type==="fly")
+					state.screen = frame;
+				
+				for(let d=msToFrameCount(delayToMS(delay));d>0;d--)
+					state.frames.push(".");
+			}
+
+			state.screen = lastFrame;
+			this();
+		},
+		function finish(err) { cb(err); }
+	);
+}
+
+// Converts a GRASP 'delay' into milliseconds
+function delayToMS(delay)
+{
+	return XU.SECOND*(+delay/100);
+}
+
+// Converts a millisecond duration into frame count
+function msToFrameCount(ms)
+{
+	return Math.floor(ms/(XU.SECOND/argv.rate));
+}
 
 // GOTO labelName - Jump to the given label in the program
 cmds.GOTO = (argRaw, state, cb) =>
@@ -320,8 +372,8 @@ cmds.GOTO = (argRaw, state, cb) =>
 	
 	if(argv.verbose)
 		msg(state, `GOTO Jumping to label ${labelName} at line ${state.labels[labelName]}`);
-	cb();	// TODO TEMPORARY
-	//cb(undefined, state.labels[labelName]);
+
+	cb(undefined, state.labels[labelName]);
 };
 
 // MARK markCount - Marks the place that LOOP will return to
@@ -366,41 +418,20 @@ cmds.LOOP = (argRaw, state, cb) =>
 	frames.serialForEach((frame, subcb) => writeFrame(state, frame, subcb), err => cb(err));
 };*/
 
-/*function writeFrame(state, frame, cb)
+// Will convert (using state.palette if set) and load the image into a GD image
+const LOADED_IMAGES = [];
+function loadImage(state, bufNums, imageType, cb)
 {
-	const frameFilePath = getFrameFilePath(state);
-	state.f++;
-
-	const convertArgs = ["-size", state.video.resolution.join("x"), `xc:${state.backgroundColor}`, frame.imageFilePath, "-geometry", `+${frame.x}+${frame.y}`];
-	if(frame.hasOwnProperty("dissolve"))
-		convertArgs.push("-compose", "dissolve", "-define", `compose:args=${frame.dissolve.toString()}`);
-	convertArgs.push("-composite", frameFilePath);
-	state.cps.push(runUtil.run("convert", convertArgs, {silent : true, detached : true}));
-
-	if(!frame.delay)
-		return setImmediate(cb);
-
-	const msPerFrame = (XU.SECOND/argv.rate);
-	const delayFrameCount = Math.floor(((frame.delay || 0)*(XU.SECOND/argv.speed))/msPerFrame);
-	if(delayFrameCount===0)
-		return setImmediate(cb);
-
-	[].pushSequence(0, delayFrameCount-1).serialForEach((i, subcb) =>
-	{
-		const symlinkFramePath = getFrameFilePath(state);
-		state.f++;
-		fs.symlink(path.basename(frameFilePath), symlinkFramePath, subcb);
-	}, cb);
-}*/
-
-// Will pre-convert the given images into PNG, using state.palette if set
-function loadImage(state, images, imageType, cb)
-{
-	const prepDirPath = fileUtil.generateTempFilePath(state.wipDirPath, "-loadImages");
+	const prepDirPath = fileUtil.generateTempFilePath(state.wipDirPath, "-loadImage");
 	fs.mkdirSync(prepDirPath);
 
-	Array.force(images).parallelForEach(({imageName, bufNum}, subcb) =>
+	Array.force(bufNums).parallelForEach((bufNum, subcb) =>
 	{
+		const imageName = state[`${imageType}Buf`][bufNum];
+		const loadedImage = LOADED_IMAGES.find(o => o.imageName===imageName && o.imageType===imageType && o.palette===state.palette);
+		if(loadedImage)
+			return setImmediate(() => subcb(undefined, loadedImage.image));
+
 		tiptoe(
 			function convertImage()
 			{
@@ -414,20 +445,19 @@ function loadImage(state, images, imageType, cb)
 			function loadIntoBuf()
 			{
 				const imageFilePath = path.join(prepDirPath, `${imageType}-${imageName}.000.png`);
-				state[`${imageType}Buf`][bufNum] = {originalPath : state[`${imageType}Paths`][imageName], filePath : imageFilePath, image : gd.createFromPngPtr(fs.readFileSync(imageFilePath))};
-				
-				this();
+				const gdImage = gd.createFromPngPtr(fs.readFileSync(imageFilePath));
+				LOADED_IMAGES.push({imageName, imageType, palette : state.palette, image : gdImage});
+				this(undefined, gdImage);
 			},
 			subcb
 		);
-	}, err => cb(err), {atOnce : 20});
+	}, cb, {atOnce : 20});
 }
 
 function processLine(state, cb)
 {
-	// TODO convert to duration
-	//if(state.f>=argv.maxFrames)
-	//	return setImmediate(cb);
+	if(state.frames.length>=MAX_FRAMES)
+		return setImmediate(cb);
 
 	const scriptLine = state.scriptLines[state.l];
 	tiptoe(
