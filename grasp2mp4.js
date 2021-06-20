@@ -19,6 +19,7 @@ const argv = cmdUtil.cmdInit({
 		keep        : {desc : "Keep temporary working files around"},
 		quiet       : {desc : "Don't output any progress messages"},
 		verbose     : {desc : "Be extra chatty"},
+		debug       : {desc : "Output lots of extra stuff to help in debugging"},
 		maxDuration : {desc : "Maximum duration of video, in seconds", noShort : true, defaultValue : 300}
 	},
 	args :
@@ -79,9 +80,6 @@ function grasp2mp4(cb)
 					// Scripts end with .txt
 					const scriptContent = fs.readFileSync(newFilePath, XU.UTF8);
 					scripts[fileNameNoExt] = scriptContent.includes("\n") ? scriptContent.replaceAll("\r", "").split("\n") : scriptContent.split("\r");
-					
-					// Ignore blank lines and lines that start with a comment
-					scripts[fileNameNoExt].filterInPlace(line => line.trim().length>0 && !line.trim().startsWith(";"));
 				}
 				else if(glFileExt===".pic")
 				{
@@ -192,7 +190,7 @@ function processScript(state, cb)
 
 const msg = (state, msgData, cb) =>
 {
-	XU.log`${state.scriptName}@${state.l.toLocaleString().padStart(state.scriptLines.length.toLocaleString().length, " ")}: ${XU.cf.fg.white(msgData)}`;
+	XU.log`${state.scriptName}@${(state.l+1).toLocaleString().padStart(state.scriptLines.length.toLocaleString().length, " ")}: ${XU.cf.fg.white(msgData)}`;
 	if(cb)
 		setImmediate(cb);
 };
@@ -222,11 +220,103 @@ function repeatFrame(state, ms)
 		state.frames.push(".");
 }
 
+// Parses an arg string for a command, it's compliant with either comma or space delimiters and extra whitespace all over
+function parseArg(argRaw, _argsIn)
+{
+	const argChars = argRaw.split("");
+	const argsIn = Array.from(_argsIn);
+	const args = {};
+
+	//XU.log`${argRaw}`;
+
+	function skipChars(chars)
+	{
+		let skipCount = 0;
+		const charsRegexp = new RegExp(`[${chars}]`);
+		while(argChars.length>0 && charsRegexp.test(argChars[0]))
+		{
+			argChars.shift();
+			skipCount++;
+		}
+
+		return skipCount;
+	}
+
+	function getChars(chars)
+	{
+		const outChars = [];
+		const charsRegexp = new RegExp(`[${chars}]`);
+		while(argChars.length>0 && charsRegexp.test(argChars[0]))
+			outChars.push(argChars.shift());
+		
+		return outChars.join("");
+	}
+
+	const getVal =
+	{
+		"num" : () => +getChars("\\d"),
+		"letter" : () => argChars.shift(),
+		"str" : () =>
+		{
+			const quoted = skipChars('"');
+			const str = getChars(quoted ? '^"' : "^, ");
+			skipChars('"');
+			return str;
+		}
+	};
+
+	let isRange = false;
+	while(argChars.length>0 && argsIn.length>0)
+	{
+		const argIn = argsIn.shift();
+		skipChars("\\s");
+
+		if(argChars[0]==="-")
+		{
+			isRange = true;
+			argChars.shift();
+			skipChars("\\s");
+		}
+
+		let argVal = getVal[argIn.type]();
+		if(argIn.transform)
+			argVal = argIn.transform(argVal);
+
+		if(argIn.repeating)
+		{
+			if(!args.hasOwnProperty(argIn.argid))
+				args[argIn.argid] = [];
+			
+			if(isRange)
+				args[argIn.argid].pushSequence(args[argIn.argid].last()+1, argVal);
+			else
+				args[argIn.argid].push(argVal);
+		}
+		else
+		{
+			args[argIn.argid] = argVal;
+		}
+		skipChars("\\s,");
+
+		if(argIn.repeating)
+			argsIn.unshift(argIn);
+	}
+
+	if(argv.debug)
+		XU.log`${argRaw} => ${args}`;
+
+	return args;
+}
+
 const cmds = {};
 
-// VIDEO mode - Switches screen video mode
+////////////////// VIDEO - Change video mode/resolution //////////////////
 cmds.VIDEO = (argRaw, state, cb) =>
 {
+	const {mode} = parseArg(argRaw, [
+		{argid : "mode", type : "letter", transform : v => v.toUpperCase()}
+	]);
+
 	if(state.video)
 		return msg(state, `VIDEO Changing video mode more than once is not currently supported`, cb);
 
@@ -242,7 +332,7 @@ cmds.VIDEO = (argRaw, state, cb) =>
 		"D" : {resolution : [640, 200], colors :  64, type : "IBM EGA"},
 		"E" : {resolution : [640, 350], colors :   2, type : "IBM EGA monochrome"},
 		"F" : {resolution : [640, 350], colors :   4, type : "IBM EGA"},
-		"G" : {resolution : [640, 350], colors :  64, type : "IBM EGA"},
+		"G" : {resolution : [640, 350], colors :  64, type : "IBM EGA", palette : [0x000000, 0x0000AA, 0x00AA00, 0x00AAAA, 0xAA0000, 0xAA00AA, 0xAAAA00, 0xAAAAAA, 0x000055, 0x0000FF, 0x00AA55, 0x00AAFF, 0xAA0055, 0xAA00FF, 0xAAAA55, 0xAAAAFF, 0x005500, 0x0055AA, 0x00FF00, 0x00FFAA, 0xAA5500, 0xAA55AA, 0xAAFF00, 0xAAFFAA, 0x005555, 0x0055FF, 0x00FF55, 0x00FFFF, 0xAA5555, 0xAA55FF, 0xAAFF55, 0xAAFFFF, 0x550000, 0x5500AA, 0x55AA00, 0x55AAAA, 0xFF0000, 0xFF00AA, 0xFFAA00, 0xFFAAAA, 0x550055, 0x5500FF, 0x55AA55, 0x55AAFF, 0xFF0055, 0xFF00FF, 0xFFAA55, 0xFFAAFF, 0x555500, 0x5555AA, 0x55FF00, 0x55FFAA, 0xFF5500, 0xFF55AA, 0xFFFF00, 0xFFFFAA, 0x555555, 0x5555FF, 0x55FF55, 0x55FFFF, 0xFF5555, 0xFF55FF, 0xFFFF55]},
 		"H" : {resolution : [720, 348], colors :   2, type : "Hercules monochrome"},
 		"I" : {resolution : [320, 200], colors :  16, type : "Plantronics/AST CGP"},
 		"J" : {resolution : [320, 200], colors :  16, type : "IBM EGA"},
@@ -251,7 +341,6 @@ cmds.VIDEO = (argRaw, state, cb) =>
 		/* eslint-enable array-bracket-spacing, no-multi-spaces, max-len */
 	};
 
-	const mode = argRaw.trim().toUpperCase();
 	if(!MODES[mode])
 		return msg(state, `VIDEO Unsupported mode ${mode} (${argRaw})`, cb);
 	
@@ -261,18 +350,23 @@ cmds.VIDEO = (argRaw, state, cb) =>
 	cb();
 };
 
-// PLOAD picName,bufNum - Load a picture into a picBuf
+////////////////// PLOAD - Load a pic into a picBuf //////////////////
 cmds.PLOAD = (argRaw, state, cb) =>
 {
-	const [imageName, bufNum] = argRaw.split(",").map(v => v.trim());
+	const {imageName, bufNum} = parseArg(argRaw, [
+		{argid : "imageName", type : "str"},
+		{argid : "bufNum", type : "num"}
+	]);
 	state.picBuf[bufNum] = imageName;
 	cb();
 };
 
-// PALETTE bufNum - Set the current working pallete from a pic in picBuf
+////////////////// PALETTE - Set the current pallete from a pic in picBuf //////////////////
 cmds.PALETTE = (argRaw, state, cb) =>
 {
-	const bufNum = argRaw.trim();
+	const {bufNum} = parseArg(argRaw, [
+		{argid : "bufNum", type : "num"}
+	]);
 	if(!state.picBuf[bufNum])
 		return msg(state, `PALETTE No pic buf loaded in ${bufNum} (${argRaw})`, cb);
 
@@ -289,7 +383,7 @@ cmds.PALETTE = (argRaw, state, cb) =>
 		},
 		function extractPaletteColors([image])
 		{
-			state.palette = {image, filePath : state.picPaths[state.picBuf[bufNum]]};
+			state.palette = {image, filePath : state.picPaths[state.picBuf[bufNum].toLowerCase()]};
 			state.paletteColors = [];
 			
 			for(let i=0;i<image.colorsTotal;i++)
@@ -307,35 +401,37 @@ cmds.PALETTE = (argRaw, state, cb) =>
 	);
 };
 
-// PFREE bufNum, bufNum, bufNum... - Frees the given picture buffers
+////////////////// PFREE - Frees the given picture picBuf pics //////////////////
 cmds.PFREE = (argRaw, state, cb) =>
 {
-	argRaw.split(",").map(v => v.trim()).forEach(bufNum =>
+	const {bufNums} = parseArg(argRaw, [
+		{argid : "bufNums", type : "num", repeating : true}
+	]);
+	bufNums.forEach(bufNum =>
 	{
-		if(!state.picBuf[bufNum])
-			msg(state, `PFREE No pic buf loaded in ${bufNum} (${argRaw})`);
-		else
+		if(state.picBuf[bufNum])
 			delete state.picBuf[bufNum];
 	});
 
 	cb();
 };
 
-// CFREE bufNum, bufNum, bufNum... - Frees the given clip buffers
+////////////////// CFREE - Frees the given picture clipBuf clips //////////////////
 cmds.CFREE = (argRaw, state, cb) =>
 {
-	argRaw.split(",").map(v => v.trim()).forEach(bufNum =>
+	const {bufNums} = parseArg(argRaw, [
+		{argid : "bufNums", type : "num", repeating : true}
+	]);
+	bufNums.forEach(bufNum =>
 	{
-		if(!state.clipBuf[bufNum])
-			msg(state, `CFREE No pic buf loaded in ${bufNum} (${argRaw})`);
-		else
+		if(state.clipBuf[bufNum])
 			delete state.clipBuf[bufNum];
 	});
 
 	cb();
 };
 
-// CLEARSCR - Clears the screen to the current drawing color
+////////////////// CFREE - Clears the screen to the current drawing color //////////////////
 cmds.CLEARSCR = (argRaw, state, cb) =>
 {
 	const frame = gd.createTrueColorSync(...state.video.resolution);
@@ -346,20 +442,32 @@ cmds.CLEARSCR = (argRaw, state, cb) =>
 	cb();
 };
 
-// CLOAD clipName, bufNum, shiftParm - Loads a clip into a clipBuf
+////////////////// CLOAD - Loads a clip into a clipBuf //////////////////
 cmds.CLOAD = (argRaw, state, cb) =>
 {
-	const [imageName, bufNum] = argRaw.split(",").map(v => v.trim());
+	const {imageName, bufNum} = parseArg(argRaw, [
+		{argid : "imageName", type : "str"},
+		{argid : "bufNum", type : "num"}
+	]);
 	state.clipBuf[bufNum] = imageName;
 	cb();
 };
 
-// FLY/FLOAT startX, startY, endX, endY, increment, delay, clip1, clip2, ...clipn - Animate 1 or more clippings between two points on the screen
+////////////////// FLY/FLOAT - Animate 1 or more clipBuf clips between two points on the screen //////////////////
 cmds.FLY = (...args) => flyFloat("fly", ...args);
 cmds.FLOAT = (...args) => flyFloat("float", ...args);
 function flyFloat(type, argRaw, state, cb)
 {
-	const [startX, startY, endX, endY, increment, delay, ...clipNums] = argRaw.split(",").map(v => v.trim()).map(v => +v);
+	const {startX, startY, endX, endY, increment, delay, clipNums} = parseArg(argRaw, [
+		{argid : "startX", type : "num"},
+		{argid : "startY", type : "num"},
+		{argid : "endX", type : "num"},
+		{argid : "endY", type : "num"},
+		{argid : "increment", type : "num"},
+		{argid : "delay", type : "num"},
+		{argid : "clipNums", type : "num", repeating : true}
+	]);
+
 	const clipNumsUnique = clipNums.unique();
 
 	tiptoe(
@@ -424,10 +532,12 @@ function flyFloat(type, argRaw, state, cb)
 	);
 }
 
-// GOTO labelName - Jump to the given label in the program
+////////////////// GOTO - Jump to the given label in the program //////////////////
 cmds.GOTO = (argRaw, state, cb) =>
 {
-	const labelName = argRaw.trim();
+	const {labelName} = parseArg(argRaw, [
+		{argid : "labelName", type : "str"}
+	]);
 	if(!state.labels.hasOwnProperty(labelName))
 		return msg(state, `GOTO Label not found yet ${labelName}`, cb);
 	
@@ -437,19 +547,22 @@ cmds.GOTO = (argRaw, state, cb) =>
 	cb(undefined, state.labels[labelName]);
 };
 
-// MARK markCount - Marks the place that LOOP will return to
+////////////////// MARK - Marks the place that the next LOOP will return to //////////////////
 cmds.MARK = (argRaw, state, cb) =>
 {
 	// If we've already found a mark on this line, just continue
 	if(state.marks.hasOwnProperty(state.l))
 		return cb();
-	
-	const markCount = argRaw.trim();
+
+	const {markCount} = parseArg(argRaw, [
+		{argid : "markCount", type : "num"}
+	]);
+
 	state.marks[state.l] = +markCount;
 	cb();
 };
 
-// LOOP - Will loop back up to the nearest MARK that still has counts remaining
+////////////////// LOOP - Will loop back up to the nearest MARK that still has counts remaining //////////////////
 cmds.LOOP = (argRaw, state, cb) =>
 {
 	const targetMarkLine = Object.entries(state.marks).filter(([markLine, markCount]) => markCount>0 && (+markLine)<state.l).map(([markLine]) => +markLine).multiSort([v => +v]).pop();
@@ -462,10 +575,13 @@ cmds.LOOP = (argRaw, state, cb) =>
 	cb(undefined, targetMarkLine);
 };
 
-// COLOR drawingColor, secondaryColor - Set the current drawing and secondary color
+////////////////// COLOR - Set the current drawing and secondary color //////////////////
 cmds.COLOR = (argRaw, state, cb) =>
 {
-	const [drawingColor, secondaryColor] = argRaw.split(",").map(v => v.trim()).map(v => +v);
+	const {drawingColor, secondaryColor=undefined} = parseArg(argRaw, [
+		{argid : "drawingColor", type : "num"},
+		{argid : "secondaryColor", type : "num"}
+	]);
 	state.drawingColor = state.video.palette[drawingColor];
 	if(typeof secondaryColor!=="undefined")
 		state.secondaryColor = secondaryColor;
@@ -473,10 +589,16 @@ cmds.COLOR = (argRaw, state, cb) =>
 	cb();
 };
 
-// BOX - Draws a box on the screen
+////////////////// BOX - Draws a box on the screen //////////////////
 cmds.BOX = (argRaw, state, cb) =>
 {
-	const [startX, startY, endX, endY, width] = argRaw.split(",").map(v => v.trim()).map(v => +v);
+	const {startX, startY, endX, endY, width=1} = parseArg(argRaw, [
+		{argid : "startX", type : "num"},
+		{argid : "startY", type : "num"},
+		{argid : "endX", type : "num"},
+		{argid : "endY", type : "num"},
+		{argid : "width", type : "num"}
+	]);
 	const frame = gd.createFromPngPtr(state.screen.pngPtr());
 	[[startX, startY, endX, startY+width], [startX, startY, startX+width, endY], [endX-width, startY, endX, endY], [startX, endY-width, endX, endY]].forEach(([sx, sy, ex, ey]) => frame.filledRectangle(sx, sy, ex, ey, state.drawingColor));
 	state.frames.push(frame);
@@ -485,19 +607,27 @@ cmds.BOX = (argRaw, state, cb) =>
 	cb();
 };
 
-// WAITKEY duration, labelName - Wait for a user to press a key
+////////////////// WAITKEY - Wait for a user to press a key, which will never happen, then optionally GOTO a label //////////////////
 cmds.WAITKEY = (argRaw, state, cb) =>
 {
-	const [duration, labelName] = argRaw.split(",").map(v => v.trim());
+	const {duration, labelName} = parseArg(argRaw, [
+		{argid : "duration", type : "num"},
+		{argid : "labelName", type : "str"}
+	]);
 
 	repeatFrame(state, delayToMS(+duration));
 	cb(undefined, state.labels[labelName] || undefined);
 };
 
-// TEXT textX, textY, text, delay - Draws text to the screen
+////////////////// TEXT - Draws text to the screen //////////////////
 cmds.TEXT = (argRaw, state, cb) =>
 {
-	const {textX, textY, text, delay=0} = (argRaw.trim().match(/^(?<textX>\d+)\s*,\s*(?<textY>\d+)\s*,\s*"(?<text>[^"]+)"\s*,?\s*(?<delay>\d*)?/) || {groups : {}}).groups;
+	const {textX, textY, text, delay=0} = parseArg(argRaw, [
+		{argid : "textX", type : "num"},
+		{argid : "textY", type : "num"},
+		{argid : "text", type : "str"},
+		{argid : "delay", type : "num"}
+	]);
 	const frame = gd.createFromPngPtr(state.screen.pngPtr());
 	// Since we don't support custom fonts and we are just using Consolas at size 10, fonts often end up in weird sports on the scren, but oh well
 	// Also, for some reason the Y coordinates are measured from the bottom of the screen instead of the top. Weird.
@@ -509,11 +639,18 @@ cmds.TEXT = (argRaw, state, cb) =>
 	cb();
 };
 
-// CFADE fadeNum, fadeX, fadeY, bufNum, speed, delay - Fades a clip to the screen at X/Y coordinates
+////////////////// CFADE - Fades a clip to the screen at X/Y coordinates //////////////////
 cmds.CFADE = (argRaw, state, cb) =>
 {
-	const [fadeNum, fadeX, fadeY, bufNum, speed=3333, delay=0] = argRaw.split(",").map(v => v.trim());	// eslint-disable-line no-unused-vars
-	if(bufNum==="0")
+	const {fadeNum, fadeX, fadeY, bufNum=0, speed=MAX_SPEED*0.98, delay=0} = parseArg(argRaw, [	// eslint-disable-line no-unused-vars
+		{argid : "fadeNum", type : "num"},
+		{argid : "fadeX", type : "num"},
+		{argid : "fadeY", type : "num"},
+		{argid : "bufNum", type : "num"},
+		{argid : "speed", type : "num"},
+		{argid : "delay", type : "num"}
+	]);
+	if(bufNum===0)
 		return msg("CFADE Unsupported bufNum 0", cb);
 
 	tiptoe(
@@ -536,15 +673,20 @@ cmds.CFADE = (argRaw, state, cb) =>
 	);
 };
 
-// PFADE fadeNum, bufNum, speed, delay - Fades a picture to the screen
+////////////////// PFADE - Fades a picture to the screen //////////////////
 cmds.PFADE = (argRaw, state, cb) =>
 {
-	const [fadeNum, bufNum, speed=3333, delay=0] = argRaw.split(",").map(v => v.trim());	// eslint-disable-line no-unused-vars
+	const {fadeNum, bufNum=0, speed=MAX_SPEED*0.98, delay=0} = parseArg(argRaw, [	// eslint-disable-line no-unused-vars
+		{argid : "fadeNum", type : "num"},
+		{argid : "bufNum", type : "num"},
+		{argid : "speed", type : "num"},
+		{argid : "delay", type : "num"}
+	]);
 
 	tiptoe(
 		function loadFadeImage()
 		{
-			if(bufNum==="0")
+			if(bufNum===0)
 			{
 				const image = gd.createTrueColorSync(...state.video.resolution);
 				image.fill(0, 0, state.drawingColor);
@@ -570,6 +712,9 @@ cmds.PFADE = (argRaw, state, cb) =>
 	);
 };
 
+// Commands we know about but are not supporting at this time
+const UNSUPPORTED_COMMANDS = ["EXIT", "DLOAD", "DFREE", "FLOAD", "NOTE", "PUTDFF"];
+
 // Will convert (using state.palette if set) and load the image into a GD image
 const LOADED_IMAGES = [];
 function loadImage(state, bufNums, imageType, cb)
@@ -579,7 +724,10 @@ function loadImage(state, bufNums, imageType, cb)
 	Array.force(bufNums).parallelForEach((bufNum, subcb) =>
 	{
 		const imageName = state[`${imageType}Buf`][bufNum];
-		const loadedImage = LOADED_IMAGES.find(o => o.imageName===imageName && o.imageType===imageType && o.palette===state.palette.filePath);
+		if(!imageName)
+			XU.log`${XU.cf.fg.red("ERROR")}: Failed to find ${imageType} image for buf #${bufNum}`;
+			
+		const loadedImage = LOADED_IMAGES.find(o => o.imageName===imageName && o.imageType===imageType && o.palette===state.palette?.filePath);
 		if(loadedImage)
 			return setImmediate(() => subcb(undefined, loadedImage.image));
 
@@ -595,6 +743,7 @@ function loadImage(state, bufNums, imageType, cb)
 				const dearkArgs = ["-od", prepDirPath, "-o", `${imageType}-${imageName}`, "-m", "pcpaint"];
 				if(state.palette)
 					dearkArgs.push("-file2", state.palette.filePath);
+
 				dearkArgs.push(state[`${imageType}Paths`][imageName]);
 
 				runUtil.run("deark", dearkArgs, runUtil.SILENT, this);
@@ -620,6 +769,9 @@ function processLine(state, cb)
 	tiptoe(
 		function parseLine()
 		{
+			if(scriptLine.trim().length===0 || scriptLine.trim().startsWith(";"))
+				return this();
+
 			// First check to see if we are defining a label
 			const {labelName} = (scriptLine.match(/^(?<labelName>\S+):/) || {groups : {}}).groups;
 			if(labelName)
@@ -632,7 +784,7 @@ function processLine(state, cb)
 				return this();
 			}
 
-			const {cmdRaw, argRaw} = (scriptLine.match(/^(?<cmdRaw>\S+) ?(?<argRaw>.+)?\s*;?.*$/) || {groups : {}}).groups;
+			const {cmdRaw, argRaw} = (scriptLine.match(/^(?<cmdRaw>\S+) ?(?<argRaw>[^;]+)?\s*;?.*$/) || {groups : {}}).groups;
 			if(!cmdRaw)
 			{
 				msg(state, `No command found: [${scriptLine}]`);
@@ -643,7 +795,17 @@ function processLine(state, cb)
 			if(!cmd)
 			{
 				if(state.l+1<state.scriptLines.length)
-					msg(state, `Unsupported command: ${cmdRaw}`);
+				{
+					if(UNSUPPORTED_COMMANDS.includes(cmdRaw.toUpperCase()))
+					{
+						if(argv.debug)
+							msg(state, `KNOWN unsupported command: ${cmdRaw}`);
+					}
+					else
+					{
+						msg(state, `NEW UNKNOWN COMMAND: ${cmdRaw}`);
+					}
+				}
 				return this();
 			}
 
@@ -652,12 +814,12 @@ function processLine(state, cb)
 		function processNextLine(err, nextLine)
 		{
 			if(err)
-				process.exit(XU.log`${XU.cf.fg.red("ERROR")} ${state.scriptName}@${state.l}: ${err}`);
+				process.exit(XU.log`${XU.cf.fg.red("ERROR")} ${state.scriptName}@${state.l+1}: ${err}`);
 			
 			if(!["undefined", "number"].includes(typeof nextLine))
 			{
 				console.trace();
-				process.exit(XU.log`${XU.cf.fg.red("ERROR")} ${state.scriptName}@${state.l}: Invalid nextLine returned`);
+				process.exit(XU.log`${XU.cf.fg.red("ERROR")} ${state.scriptName}@${state.l+1}: Invalid nextLine returned`);
 			}
 
 			if(typeof nextLine!=="undefined")
